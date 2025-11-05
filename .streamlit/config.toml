@@ -1,0 +1,12 @@
+[server]
+enableXsrfProtection = true
+folderWatchBlacklist = [".git", "dist", "build"]
+port = 8501
+
+[theme]
+base = "light"
+primaryColor = "#00519B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F5"
+textColor = "#000000"
+font = "sans serif"
