@@ -3,11 +3,12 @@
 # - Upload Excel (financials.xlsx)
 # - Pick Developer (numbered list), pick Technology (only dev's techs)
 # - Per-ISO chart shows only hubs where the dev has that Tech
-# - P25→P50 solid box; whiskers P50→P90 & P25→P10; P-labels inside/outside + per-hub nudges
+# - NEW: Box Mode toggle: P25–P50 only, P10–P50 only, or Full (with whiskers)
+# - P-labels inside/outside + per-hub nudges
 # - Degenerate case: P50 line + label
 # - Transparent PNG download
 # - Solar+Storage/BESS normalized to Solar
-# - NEW: Y-axis controls (include developer dots in limits, extra padding, optional forced Y-min)
+# - Y-axis controls (include developer dots in limits, extra padding, optional forced Y-min)
 
 import streamlit as st
 import pandas as pd
@@ -146,7 +147,8 @@ def draw_iso_panel(
     dot_color="#5B6670",
     legend_bottom_center=True,
     legend_frame=False,
-    font_scale=1.0
+    font_scale=1.0,
+    box_mode="P25-P50"  # "P25-P50", "P10-P50", "Full"
 ):
     if tech_colors is None:
         tech_colors = TECH_COLORS_DEFAULT
@@ -191,7 +193,7 @@ def draw_iso_panel(
     fs_lbl  = 9  * font_scale
     lw_edge = edge_width
 
-    # Draw boxes/whiskers/labels
+    # Draw boxes / (optional) whiskers / labels
     for h in dev_hubs:
         if h not in hub_stats:
             continue
@@ -201,6 +203,7 @@ def draw_iso_panel(
                       abs(stt["p50"]-stt["p10"]) < TOL)
 
         if degenerate:
+            # Fallback: show median line only
             ax.hlines(stt["p50"], x - box_width/2, x + box_width/2,
                       color=box_color, linewidth=lw_edge, zorder=2)
             y_off = (label_offsets_for_iso.get(h, {}) if label_offsets_for_iso else {}).get("P50", 0.0)
@@ -208,24 +211,49 @@ def draw_iso_panel(
             ax.text(x_lbl, stt["p50"] + y_off, "P50",
                     va="center", ha=ha, fontsize=fs_lbl, zorder=3)
         else:
+            # Determine which box to draw and which labels to show
+            if box_mode == "P25-P50":
+                y0, y1 = stt["p25"], stt["p50"]
+                labels_to_show = [("P25", stt["p25"]), ("P50", stt["p50"])]
+                draw_whiskers = False
+            elif box_mode == "P10-P50":
+                y0, y1 = stt["p10"], stt["p50"]
+                labels_to_show = [("P10", stt["p10"]), ("P50", stt["p50"])]
+                draw_whiskers = False
+            else:  # "Full"
+                y0, y1 = stt["p25"], stt["p50"]
+                labels_to_show = None  # we'll do staggered all labels
+                draw_whiskers = True
+
+            # Draw filled box
             ax.add_patch(plt.Rectangle(
-                (x - box_width/2, stt["p25"]),
-                box_width, stt["p50"] - stt["p25"],
+                (x - box_width/2, y0),
+                box_width, y1 - y0,
                 facecolor=face_rgba, edgecolor=box_color,
                 linewidth=lw_edge, zorder=1
             ))
-            ax.vlines(x, stt["p50"], stt["p90"], color=box_color, linewidth=lw_edge, zorder=1)
-            ax.hlines(stt["p90"], x - cap_half, x + cap_half, color=box_color, linewidth=lw_edge, zorder=1)
-            ax.vlines(x, stt["p25"], stt["p10"], color=box_color, linewidth=lw_edge, zorder=1)
-            ax.hlines(stt["p10"], x - cap_half, x + cap_half, color=box_color, linewidth=lw_edge, zorder=1)
 
-            span = max(stt["p90"] - stt["p10"], 1.0)
-            eps = max(0.01 * span, 0.25)
-            for y_auto, label in staggered_labels(stt, eps):
-                y_off = (label_offsets_for_iso.get(h, {}) if label_offsets_for_iso else {}).get(label, 0.0)
-                x_lbl, ha = label_pos(x)
-                ax.text(x_lbl, y_auto + y_off, label,
-                        va="center", ha=ha, fontsize=fs_lbl, zorder=3)
+            if draw_whiskers:
+                # Original whiskers + all labels
+                ax.vlines(x, stt["p50"], stt["p90"], color=box_color, linewidth=lw_edge, zorder=1)
+                ax.hlines(stt["p90"], x - cap_half, x + cap_half, color=box_color, linewidth=lw_edge, zorder=1)
+                ax.vlines(x, stt["p25"], stt["p10"], color=box_color, linewidth=lw_edge, zorder=1)
+                ax.hlines(stt["p10"], x - cap_half, x + cap_half, color=box_color, linewidth=lw_edge, zorder=1)
+
+                span = max(stt["p90"] - stt["p10"], 1.0)
+                eps = max(0.01 * span, 0.25)
+                for y_auto, label in staggered_labels(stt, eps):
+                    y_off = (label_offsets_for_iso.get(h, {}) if label_offsets_for_iso else {}).get(label, 0.0)
+                    x_lbl, ha = label_pos(x)
+                    ax.text(x_lbl, y_auto + y_off, label,
+                            va="center", ha=ha, fontsize=fs_lbl, zorder=3)
+            else:
+                # No whiskers. Label only the two bounds of the chosen box.
+                for label, yval in labels_to_show:
+                    y_off = (label_offsets_for_iso.get(h, {}) if label_offsets_for_iso else {}).get(label, 0.0)
+                    x_lbl, ha = label_pos(x)
+                    ax.text(x_lbl, yval + y_off, label,
+                            va="center", ha=ha, fontsize=fs_lbl, zorder=3)
 
     # Developer dots for THIS tech & ISO
     dot_drawn = False
@@ -235,7 +263,7 @@ def draw_iso_panel(
             continue
         x = xpos[h]
         ax.scatter(np.full(len(vals), x), vals,
-                   s=46, color="#5B6670", edgecolor="black", linewidth=0.4,
+                   s=46, color=dot_color, edgecolor="black", linewidth=0.4,
                    alpha=0.95, zorder=5,
                    label=f"{dev_name} Projects" if not dot_drawn else None)
         dot_drawn = True
@@ -314,6 +342,15 @@ if uploaded is not None:
         force_ymin          = st.checkbox("Force Y-axis minimum", value=False)
         y_min_value         = st.number_input("Y min (if forced)", value=0.00, step=1.0) if force_ymin else None
 
+        st.markdown("---")
+        st.subheader("Box Mode")
+        box_mode = st.radio(
+            "Choose how the box should be drawn",
+            options=["P25-P50", "P10-P50", "Full"],
+            index=0,  # default to P25–P50 only
+            help="P25–P50 or P10–P50 draw only a solid box with no whiskers. Full shows whiskers (P10–P90)."
+        )
+
     # ISOs where this dev has the chosen Tech
     dev_isos = sorted(df_dev.loc[df_dev[TECH_COL]==tech, ISO_COL].unique().tolist())
     if not dev_isos:
@@ -376,7 +413,8 @@ if uploaded is not None:
             dot_color=dot_color,
             legend_bottom_center=legend_bottom_center,
             legend_frame=legend_frame,
-            font_scale=font_scale
+            font_scale=font_scale,
+            box_mode=box_mode,  # <-- pass the selected mode
         )
         ax.set_xlabel(None)
         ax.set_ylabel(PRICE_COL)
