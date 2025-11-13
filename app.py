@@ -32,8 +32,8 @@ TECH_COLORS_DEFAULT = {"Solar": "#FFC000", "Wind": "#00519B"}
 MIXED_TECH_COLOR    = "#0EC477"
 DOT_COLOR_DEFAULT   = "#5B6670"
 
-LABEL_XOFFSET_DEFAULT       = 0.03
-CENTER_SINGLE_HUB_DEFAULT   = True
+LABEL_XOFFSET_DEFAULT        = 0.03
+CENTER_SINGLE_HUB_DEFAULT    = True
 LEGEND_BOTTOM_CENTER_DEFAULT = True
 LEGEND_FRAME_DEFAULT         = False
 FONT_SCALE_DEFAULT           = 0.50
@@ -85,10 +85,12 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def staggered_labels(stt: dict, eps: float):
-    items = [("P90", stt["p90"]),
-             ("P50", stt["p50"]),
-             ("P25", stt["p25"]),
-             ("P10", stt["p10"])]
+    items = [
+        ("P90", stt["p90"]),
+        ("P50", stt["p50"]),
+        ("P25", stt["p25"]),
+        ("P10", stt["p10"]),
+    ]
     out, placed = [], []
     for name, y in items:
         y_adj = y
@@ -457,33 +459,55 @@ if uploaded is not None:
 
         st.markdown("---")
         st.subheader("Fonts")
-        font_family = st.selectbox(
-            "Font family",
-            [
-                "Auto",
-                "DejaVu Sans",
-                "Arial",
-                "Helvetica",
-                "Calibri",
-                "Verdana",
-                "Times New Roman",
-                "Georgia",
-                "Courier New",
-                "sans-serif",
-                "serif",
-                "monospace",
-            ],
+
+        # Display names in clean Title Case, mapped to actual backend values
+        font_display_names = [
+            "Auto",
+            "Arial",
+            "Calibri",
+            "Courier New",
+            "DejaVu Sans",
+            "Georgia",
+            "Helvetica",
+            "Monospace",
+            "Sans-Serif",
+            "Serif",
+            "Times New Roman",
+            "Verdana",
+        ]
+
+        font_map = {
+            "Auto": None,
+            "Arial": "Arial",
+            "Calibri": "Calibri",
+            "Courier New": "Courier New",
+            "DejaVu Sans": "DejaVu Sans",
+            "Georgia": "Georgia",
+            "Helvetica": "Helvetica",
+            "Monospace": "monospace",
+            "Sans-Serif": "sans-serif",
+            "Serif": "serif",
+            "Times New Roman": "Times New Roman",
+            "Verdana": "Verdana",
+        }
+
+        font_family_display = st.selectbox(
+            "Font Family",
+            options=font_display_names,
             index=0,
         )
+
+        selected_font = font_map[font_family_display]
+        if selected_font is not None:
+            plt.rcParams["font.family"] = selected_font
+
         font_scale = st.slider(
-            "Font scale",
+            "Font Scale",
             0.50,
             1.50,
             FONT_SCALE_DEFAULT,
             0.05,
         )
-        if font_family != "Auto":
-            plt.rcParams["font.family"] = font_family
 
         st.markdown("---")
         st.subheader("Colors")
