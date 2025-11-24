@@ -1,16 +1,10 @@
-# app.py
-# ISO/RTO Price Distribution for a single developer.
-# - Upload Excel (financials.xlsx)
-# - Pick Developer (single), pick Technology (or All Technologies)
-# - Per ISO charts for that developer
-# - Box Mode: P25 to P50 only, P10 to P50 only, or Full (with whiskers)
-# - P labels always outside; per hub nudges supported
-# - Degenerate case: P50 line plus label
-# - Transparent PNG download
-# - Solar+Storage/BESS normalized to Solar
-# - Y axis within each ISO is always shared across its hubs
-# - When All Technologies is selected, developer dots are hidden
-# - Font scale and font family controls
+# ------------------------------------------------------------
+# ISO/RTO Price Distribution App – Updated
+# - Calibri default font if installed
+# - Auto-detect fonts but filter out TeX / CM / STIX / Adobe math fonts
+# - Center single hub always ON (no sidebar toggle)
+# - P25-P75 mode hides P50 label
+# ------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -18,36 +12,44 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 from matplotlib import colors as mcolors
+from matplotlib import font_manager as fm
 from io import BytesIO
 
-# ---------- Expected columns ----------
+# ------------------------------------------------------------
+# Global Default Font
+# ------------------------------------------------------------
+
+plt.rcParams["font.family"] = "Calibri"
+
+
+# ------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------
+
 PRICE_COL  = "Price ($/MWh)"
 DEV_COL    = "Developer"
 ISO_COL    = "ISO/RTO"
 HUB_COL    = "Settlement Hub"
 TECH_COL   = "Technology"
 
-# ---------- Defaults ----------
 TECH_COLORS_DEFAULT = {"Solar": "#FFC000", "Wind": "#00519B"}
 MIXED_TECH_COLOR    = "#0EC477"
 DOT_COLOR_DEFAULT   = "#5B6670"
 
-LABEL_XOFFSET_DEFAULT        = 0.03
-CENTER_SINGLE_HUB_DEFAULT    = True
-LEGEND_BOTTOM_CENTER_DEFAULT = True
-LEGEND_FRAME_DEFAULT         = False
-FONT_SCALE_DEFAULT           = 0.50
+LABEL_XOFFSET_DEFAULT = 0.03
+FONT_SCALE_DEFAULT    = 0.80
 
-# ---------- Helpers ----------
+
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+
 def fmt_currency(x, pos):
     s = f"${abs(x):,.2f}"
     return f"({s})" if x < 0 else s
 
-def pct_stats(vals: np.ndarray):
-    p10, p25, p50, p75, p90 = np.percentile(vals, [10, 25, 50, 75, 90])
-    return dict(p10=p10, p25=p25, p50=p50, p75=p75, p90=p90)
 
-def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+def clean_df(df):
     required = [PRICE_COL, DEV_COL, ISO_COL, HUB_COL, TECH_COL]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -58,15 +60,14 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df[PRICE_COL] = pd.to_numeric(df[PRICE_COL], errors="coerce")
     df = df.dropna(subset=[PRICE_COL])
 
-    df[DEV_COL] = df[DEV_COL].astype(str).str.strip().str.title()
-    df[ISO_COL] = df[ISO_COL].astype(str).str.strip()
-    df[HUB_COL] = df[HUB_COL].astype(str).str.strip().str.upper()
+    df[DEV_COL]  = df[DEV_COL].astype(str).str.strip().str.title()
+    df[ISO_COL]  = df[ISO_COL].astype(str).str.strip()
+    df[HUB_COL]  = df[HUB_COL].astype(str).str.strip().str.upper()
 
-    # Normalize Technology (treat Solar+Storage/BESS as Solar)
-    def _norm_tech(s: str) -> str:
+    def _norm_tech(s):
         s = str(s).strip()
         low = s.lower()
-        if ("solar" in low) and (("bess" in low) or ("storage" in low)):
+        if ("solar" in low) and ("bess" in low or "storage" in low):
             return "Solar"
         if "solar" in low:
             return "Solar"
@@ -76,105 +77,137 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df[TECH_COL] = df[TECH_COL].map(_norm_tech)
 
-    # Treat AESO / Alberta hubs as one
     df[HUB_COL] = df[HUB_COL].replace(
-        to_replace=r".*\bALBERTA\b.*",
-        value="ALBERTA",
+        r".*\bALBERTA\b.*",
+        "ALBERTA",
         regex=True
     )
+
     return df
 
-def staggered_labels(stt: dict, eps: float):
-    items = [
+
+@st.cache_data(show_spinner=False)
+def precompute_hub_stats(df):
+    qs = [0.10, 0.25, 0.50, 0.75, 0.90]
+
+    per_tech = (
+        df.groupby([ISO_COL, HUB_COL, TECH_COL])[PRICE_COL]
+          .quantile(qs)
+          .unstack(level=-1)
+          .rename(columns={
+              0.10: "p10", 0.25: "p25", 0.50: "p50",
+              0.75: "p75", 0.90: "p90"
+          })
+          .reset_index()
+    )
+
+    all_tech = (
+        df.groupby([ISO_COL, HUB_COL])[PRICE_COL]
+          .quantile(qs)
+          .unstack(level=-1)
+          .rename(columns={
+              0.10: "p10", 0.25: "p25", 0.50: "p50",
+              0.75: "p75", 0.90: "p90"
+          })
+          .reset_index()
+    )
+    all_tech[TECH_COL] = "All Technologies"
+
+    return pd.concat([per_tech, all_tech], ignore_index=True)
+
+
+def staggered_labels(stt, eps):
+    pts = [
         ("P90", stt["p90"]),
+        ("P75", stt["p75"]),
         ("P50", stt["p50"]),
         ("P25", stt["p25"]),
         ("P10", stt["p10"]),
     ]
-    out, placed = [], []
-    for name, y in items:
+    placed, out = [], []
+    for label, y in pts:
         y_adj = y
-        for y_prev, _ in placed:
-            if abs(y_adj - y_prev) < eps:
-                y_adj = y_prev - eps * 0.6
-        placed.append((y_adj, name))
-        out.append((y_adj, name))
+        for yy, _ in placed:
+            if abs(y_adj - yy) < eps:
+                y_adj = yy - eps * 0.6
+        placed.append((y_adj, label))
+        out.append((y_adj, label))
     return out
 
+
 def compute_iso_ylim_for_scope(
-    df_all,
-    iso,
-    hubs,
-    tech_or_none,
-    dev_vals=None,
-    extra_pad_abs=0.0,
-    y_floor=None
+    stats_df, iso, hubs, tech_or_none,
+    dev_vals=None, extra_pad_abs=0.0, y_floor=None
 ):
     lo, hi = np.inf, -np.inf
-    df_t = df_all[df_all[ISO_COL] == iso]
-    if tech_or_none is not None:
-        df_t = df_t[df_t[TECH_COL] == tech_or_none]
 
-    for h in hubs:
-        vals = df_t.loc[df_t[HUB_COL] == h, PRICE_COL].to_numpy()
-        if len(vals) == 0:
-            continue
-        stt = pct_stats(vals)
-        lo = min(lo, stt["p10"])
-        hi = max(hi, stt["p90"])
+    df_iso = stats_df[stats_df[ISO_COL] == iso]
+
+    if tech_or_none is None:
+        df_iso = df_iso[df_iso[TECH_COL] == "All Technologies"]
+    else:
+        df_iso = df_iso[df_iso[TECH_COL] == tech_or_none]
+
+    df_iso = df_iso[df_iso[HUB_COL].isin(hubs)]
+
+    if not df_iso.empty:
+        lo = float(df_iso["p10"].min())
+        hi = float(df_iso["p90"].max())
 
     if lo == np.inf:
-        if dev_vals is not None and len(dev_vals) > 0:
-            lo, hi = float(np.min(dev_vals)), float(np.max(dev_vals))
+        if dev_vals is not None and len(dev_vals):
+            lo, hi = dev_vals.min(), dev_vals.max()
         else:
-            lo, hi = 0.0, 1.0
+            lo, hi = 0, 1
 
-    if dev_vals is not None and len(dev_vals) > 0:
-        lo = min(lo, float(np.min(dev_vals)))
-        hi = max(hi, float(np.max(dev_vals)))
+    if dev_vals is not None and len(dev_vals):
+        lo = min(lo, float(dev_vals.min()))
+        hi = max(hi, float(dev_vals.max()))
 
-    pad_prop = 0.05 * (hi - lo if hi > lo else 1.0)
-    lo -= pad_prop + max(0.0, float(extra_pad_abs))
-    hi += pad_prop + max(0.0, float(extra_pad_abs))
+    span = hi - lo if hi > lo else 1.0
+    pad = 0.05 * span
+
+    lo -= pad + extra_pad_abs
+    hi += pad + extra_pad_abs
 
     if y_floor is not None:
         lo = float(y_floor)
 
-    if not (lo < hi):
-        hi = lo + 1.0
+    if not lo < hi:
+        hi = lo + 1
 
-    return (lo, hi)
+    return lo, hi
 
-def save_png_transparent(fig) -> BytesIO:
-    orig_facecolors = []
+
+def save_png_transparent(fig):
+    orig = [ax.get_facecolor() for ax in fig.get_axes()]
     for ax in fig.get_axes():
-        orig_facecolors.append(ax.get_facecolor())
         ax.set_facecolor("none")
     fig.patch.set_alpha(0.0)
 
     buf = BytesIO()
-    fig.savefig(
-        buf,
-        format="png",
-        dpi=220,
-        bbox_inches="tight",
-        transparent=True
-    )
+    fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", transparent=True)
     buf.seek(0)
 
-    for ax, fc in zip(fig.get_axes(), orig_facecolors):
+    for ax, fc in zip(fig.get_axes(), orig):
         ax.set_facecolor(fc)
     fig.patch.set_alpha(1.0)
+
     return buf
 
-# ---------- Drawing: per ISO panels (single developer) ----------
+
+# ------------------------------------------------------------
+# Drawing function
+# ------------------------------------------------------------
+
 def draw_iso_panel(
     ax, *,
     df_all,
-    df_panel_scope,
+    stats_df,
+    df_scope,
     iso,
     tech_or_none,
-    dev_name,
+    dev,
     tech_label,
     box_width,
     hub_step,
@@ -183,195 +216,150 @@ def draw_iso_panel(
     fill_alpha,
     cap_width_fr,
     show_grid_y,
-    share_ylim=None,
-    label_offsets_for_iso=None,
-    center_single_hub=True,
-    tech_colors=None,
-    mixed_color=MIXED_TECH_COLOR,
-    dot_color="#5B6670",
-    legend_bottom_center=True,
-    legend_frame=False,
-    font_scale=1.0,
-    box_mode="P25-P50",
-    draw_dev_dots=True
+    share_ylim,
+    center_single,
+    tech_colors,
+    mixed_color,
+    dot_color,
+    legend_bottom,
+    legend_frame,
+    font_scale,
+    box_mode,
+    draw_dev_dots
 ):
-    if tech_colors is None:
-        tech_colors = TECH_COLORS_DEFAULT
-
-    dev_hubs = sorted(df_panel_scope[HUB_COL].unique().tolist())
-    if not dev_hubs:
+    hubs = sorted(df_scope[HUB_COL].unique().tolist())
+    if not hubs:
         ax.text(
-            0.5,
-            0.5,
+            0.5, 0.5,
             f"No {tech_label} projects in {iso}",
-            ha="center",
-            va="center",
+            ha="center", va="center",
             transform=ax.transAxes
         )
         ax.axis("off")
         return
 
-    if center_single_hub and len(dev_hubs) == 1:
-        xpos = {dev_hubs[0]: 0.0}
+    # Center when only one hub
+    if center_single and len(hubs) == 1:
+        xpos = {hubs[0]: 0}
         ax.set_xlim(-hub_step, hub_step)
     else:
-        xpos = {h: i * hub_step for i, h in enumerate(dev_hubs)}
+        xpos = {h: i * hub_step for i, h in enumerate(hubs)}
 
-    df_boxes = df_all[df_all[ISO_COL] == iso]
-    if tech_or_none is not None:
-        df_boxes = df_boxes[df_boxes[TECH_COL] == tech_or_none]
+    # Select stats
+    df_stats = stats_df[stats_df[ISO_COL] == iso]
 
-    box_color = (
-        mixed_color
-        if tech_or_none is None
-        else tech_colors.get(tech_or_none, "#333333")
-    )
-    face_rgba = mcolors.to_rgba(box_color, fill_alpha)
+    if tech_or_none is None:
+        df_stats = df_stats[df_stats[TECH_COL] == "All Technologies"]
+    else:
+        df_stats = df_stats[df_stats[TECH_COL] == tech_or_none]
 
-    hub_stats = {}
-    for h in dev_hubs:
-        vals = df_boxes.loc[df_boxes[HUB_COL] == h, PRICE_COL].to_numpy()
-        if len(vals) > 0:
-            hub_stats[h] = pct_stats(vals)
+    df_stats = df_stats[df_stats[HUB_COL].isin(hubs)]
 
-    TOL = 1e-9
-    cap_half = min(box_width * cap_width_fr, hub_step * cap_width_fr)
+    hub_stats = {
+        row[HUB_COL]: dict(
+            p10=row["p10"], p25=row["p25"], p50=row["p50"],
+            p75=row["p75"], p90=row["p90"]
+        )
+        for _, row in df_stats.iterrows()
+    }
+
+    box_color = mixed_color if tech_or_none is None else tech_colors.get(tech_or_none, "#333333")
+    face = mcolors.to_rgba(box_color, fill_alpha)
+    cap_half = box_width * cap_width_fr
 
     def label_pos(x):
         return x + box_width / 2 + max(0.005, label_xoffset), "left"
 
     fs_tick = 10 * font_scale
     fs_lbl  = 9 * font_scale
-    lw_edge = edge_width
 
-    for h in dev_hubs:
+    for h in hubs:
         if h not in hub_stats:
             continue
+
         stt = hub_stats[h]
-        x = xpos[h]
+        x   = xpos[h]
+
+        y25, y50, y75 = stt["p25"], stt["p50"], stt["p75"]
+        y10, y90      = stt["p10"], stt["p90"]
 
         degenerate = (
-            abs(stt["p90"] - stt["p10"]) < TOL
-            and abs(stt["p75"] - stt["p25"]) < TOL
-            and abs(stt["p50"] - stt["p10"]) < TOL
+            abs(y90 - y10) < 1e-9 and
+            abs(y75 - y25) < 1e-9 and
+            abs(y50 - y10) < 1e-9
         )
-
-        offsets_for_hub = label_offsets_for_iso.get(h, {}) if label_offsets_for_iso else {}
 
         if degenerate:
             ax.hlines(
-                stt["p50"],
-                x - box_width / 2,
-                x + box_width / 2,
-                color=box_color,
-                linewidth=lw_edge,
-                zorder=2,
+                y50, x - box_width / 2, x + box_width / 2,
+                color=box_color, linewidth=edge_width
             )
-            y_off = offsets_for_hub.get("P50", 0.0)
-            x_lbl, ha = label_pos(x)
-            ax.text(
-                x_lbl,
-                stt["p50"] + y_off,
-                "P50",
-                va="center",
-                ha=ha,
-                fontsize=fs_lbl,
-                zorder=3,
+            xlbl, ha = label_pos(x)
+            ax.text(xlbl, y50, "P50", fontsize=fs_lbl, va="center", ha=ha)
+            continue
+
+        # ------------ Box Modes ------------
+
+        if box_mode == "P25-P75":
+            y0, y1 = y25, y75
+            labels = [("P25", y25), ("P75", y75)]  # Hide P50 in this mode
+            whisk  = False
+
+        elif box_mode == "P25-P50":
+            y0, y1 = y25, y50
+            labels = [("P25", y25), ("P50", y50)]
+            whisk  = False
+
+        elif box_mode == "P10-P50":
+            y0, y1 = y10, y50
+            labels = [("P10", y10), ("P50", y50)]
+            whisk  = False
+
+        else:  # Full (P10–P90)
+            y0, y1 = y25, y75
+            labels = None
+            whisk  = True
+
+        # Box
+        ax.add_patch(
+            plt.Rectangle(
+                (x - box_width / 2, y0),
+                box_width, y1 - y0,
+                facecolor=face,
+                edgecolor=box_color,
+                linewidth=edge_width
             )
+        )
+
+        # Whiskers
+        if whisk:
+            ax.vlines(x, y75, y90, color=box_color, linewidth=edge_width)
+            ax.hlines(y90, x - cap_half, x + cap_half,
+                      color=box_color, linewidth=edge_width)
+
+            ax.vlines(x, y25, y10, color=box_color, linewidth=edge_width)
+            ax.hlines(y10, x - cap_half, x + cap_half,
+                      color=box_color, linewidth=edge_width)
+
+            span = max(y90 - y10, 1.0)
+            eps  = max(0.01 * span, 0.25)
+            for y_adj, lbl in staggered_labels(stt, eps):
+                xlbl, ha = label_pos(x)
+                ax.text(xlbl, y_adj, lbl, fontsize=fs_lbl, va="center", ha=ha)
+
         else:
-            if box_mode == "P25-P50":
-                y0, y1 = stt["p25"], stt["p50"]
-                labels_to_show = [("P25", stt["p25"]), ("P50", stt["p50"])]
-                draw_whiskers = False
-            elif box_mode == "P10-P50":
-                y0, y1 = stt["p10"], stt["p50"]
-                labels_to_show = [("P10", stt["p10"]), ("P50", stt["p50"])]
-                draw_whiskers = False
-            else:
-                y0, y1 = stt["p25"], stt["p50"]
-                labels_to_show = None
-                draw_whiskers = True
+            for lbl, yv in labels:
+                xlbl, ha = label_pos(x)
+                ax.text(xlbl, yv, lbl, fontsize=fs_lbl, va="center", ha=ha)
 
-            ax.add_patch(
-                plt.Rectangle(
-                    (x - box_width / 2, y0),
-                    box_width,
-                    y1 - y0,
-                    facecolor=face_rgba,
-                    edgecolor=box_color,
-                    linewidth=lw_edge,
-                    zorder=1,
-                )
-            )
-
-            if draw_whiskers:
-                ax.vlines(
-                    x,
-                    stt["p50"],
-                    stt["p90"],
-                    color=box_color,
-                    linewidth=lw_edge,
-                    zorder=1,
-                )
-                ax.hlines(
-                    stt["p90"],
-                    x - cap_half,
-                    x + cap_half,
-                    color=box_color,
-                    linewidth=lw_edge,
-                    zorder=1,
-                )
-                ax.vlines(
-                    x,
-                    stt["p25"],
-                    stt["p10"],
-                    color=box_color,
-                    linewidth=lw_edge,
-                    zorder=1,
-                )
-                ax.hlines(
-                    stt["p10"],
-                    x - cap_half,
-                    x + cap_half,
-                    color=box_color,
-                    linewidth=lw_edge,
-                    zorder=1,
-                )
-
-                span = max(stt["p90"] - stt["p10"], 1.0)
-                eps = max(0.01 * span, 0.25)
-                for y_auto, label in staggered_labels(stt, eps):
-                    y_off = offsets_for_hub.get(label, 0.0)
-                    x_lbl, ha = label_pos(x)
-                    ax.text(
-                        x_lbl,
-                        y_auto + y_off,
-                        label,
-                        va="center",
-                        ha=ha,
-                        fontsize=fs_lbl,
-                        zorder=3,
-                    )
-            else:
-                for label, yval in labels_to_show:
-                    y_off = offsets_for_hub.get(label, 0.0)
-                    x_lbl, ha = label_pos(x)
-                    ax.text(
-                        x_lbl,
-                        yval + y_off,
-                        label,
-                        va="center",
-                        ha=ha,
-                        fontsize=fs_lbl,
-                        zorder=3,
-                    )
-
-    dot_drawn = False
+    # Draw developer dots
     if draw_dev_dots:
-        for h in dev_hubs:
-            vals = df_panel_scope.loc[df_panel_scope[HUB_COL] == h, PRICE_COL].to_numpy()
+        label_once = False
+        for h in hubs:
+            vals = df_scope.loc[df_scope[HUB_COL] == h, PRICE_COL].to_numpy()
             if len(vals) == 0:
                 continue
+
             x = xpos[h]
             ax.scatter(
                 np.full(len(vals), x),
@@ -381,331 +369,235 @@ def draw_iso_panel(
                 edgecolor="black",
                 linewidth=0.4,
                 alpha=0.95,
-                zorder=5,
-                label=f"{dev_name} Projects" if not dot_drawn else None,
+                label=f"{dev} Projects" if not label_once else None
             )
-            dot_drawn = True
+            label_once = True
 
-    ax.set_xticks([xpos[h] for h in dev_hubs])
-    ax.set_xticklabels(dev_hubs, rotation=25, ha="right", fontsize=fs_tick)
+    ax.set_xticks([xpos[h] for h in hubs])
+    ax.set_xticklabels(hubs, rotation=25, ha="right", fontsize=fs_tick)
+
     ax.yaxis.set_major_formatter(FuncFormatter(fmt_currency))
     for lbl in ax.yaxis.get_ticklabels():
         lbl.set_fontsize(fs_tick)
-    ax.grid(axis="y", alpha=(0.2 if show_grid_y else 0.0))
 
-    if share_ylim is not None:
-        ax.set_ylim(*share_ylim)
-
+    ax.grid(axis="y", alpha=0.2 if show_grid_y else 0.0)
+    ax.set_ylim(*share_ylim)
     ax.margins(x=0.15)
 
-    if draw_dev_dots and dot_drawn:
-        if legend_bottom_center:
-            ax.legend(
-                frameon=legend_frame,
-                loc="lower center",
-                bbox_to_anchor=(0.5, -0.22),
-                fontsize=fs_lbl,
-            )
-        else:
-            ax.legend(
-                frameon=legend_frame,
-                loc="upper right",
-                fontsize=fs_lbl,
-            )
+    if draw_dev_dots:
+        ax.legend(
+            frameon=legend_frame,
+            loc=("lower center" if legend_bottom else "upper right"),
+            bbox_to_anchor=(0.5, -0.22) if legend_bottom else None,
+            fontsize=fs_lbl
+        )
 
-# ---------- UI ----------
+
+# ------------------------------------------------------------
+# UI
+# ------------------------------------------------------------
+
 st.set_page_config(page_title="ISO/RTO Price Distribution", layout="wide")
 st.title("ISO/RTO Price Distribution")
 
 uploaded = st.file_uploader("Upload financials.xlsx", type=["xlsx"])
 
 if uploaded is not None:
-    raw = pd.read_excel(uploaded)
-    df = clean_df(raw)
 
-    # Developer picker (single dev only)
-    devs = sorted(df[DEV_COL].dropna().unique().tolist())
-    if not devs:
-        st.error("No developers found in data.")
+    df = clean_df(pd.read_excel(uploaded))
+
+    # Filter hubs with <=3 rows
+    hub_counts = df.groupby([ISO_COL, HUB_COL])[PRICE_COL].count()
+    valid = hub_counts[hub_counts > 3].index
+
+    df = (
+        df.set_index([ISO_COL, HUB_COL])
+          .loc[lambda x: x.index.isin(valid)]
+          .reset_index()
+    )
+
+    if df.empty:
+        st.error("All hubs were filtered out by the <=3 rows rule.")
         st.stop()
 
-    dev_choice = st.selectbox("Select Developer", options=devs, index=0)
-    dev = dev_choice
-    df_dev_scope = df[df[DEV_COL] == dev]
+    df[ISO_COL] = df[ISO_COL].astype("category")
+    df[HUB_COL] = df[HUB_COL].astype("category")
+    df[TECH_COL] = df[TECH_COL].astype("category")
+    df[DEV_COL] = df[DEV_COL].astype("category")
 
-    # Technology dropdown (per developer)
-    tech_options = sorted(df_dev_scope[TECH_COL].unique().tolist())
-    tech_options = ["All Technologies"] + tech_options
-    tech_choice = st.selectbox("Select Technology", options=tech_options, index=0)
-    all_techs = (tech_choice == "All Technologies")
-    tech_selected = None if all_techs else tech_choice
-    tech_label = "All Technologies" if all_techs else tech_choice
+    stats_df = precompute_hub_stats(df)
 
+    devs = sorted(df[DEV_COL].unique().tolist())
+    dev  = st.selectbox("Select Developer", devs)
+
+    df_dev = df[df[DEV_COL] == dev]
+
+    techs = ["All Technologies"] + sorted(df_dev[TECH_COL].unique().tolist())
+    tech_choice = st.selectbox("Select Technology", techs)
+
+    all_techs  = (tech_choice == "All Technologies")
+    tech_sel   = None if all_techs else tech_choice
+    tech_label = tech_choice
+
+    # ------------------------------------------------------------
+    # Auto-detect fonts & filter out TeX/CM/STIX/Adobe math fonts
+    # ------------------------------------------------------------
+
+    raw_fonts = sorted({f.name for f in fm.fontManager.ttflist})
+
+    exclude_prefixes = (
+        "cm", "CM",          # Computer Modern fonts
+        "TeX",               # TeX Gyre
+        "STIX",              # STIX math fonts
+        "ZWAdobeF",          # Adobe math
+        "ZW",                # any ZW* Adobe fonts
+    )
+
+    filtered_fonts = [
+        f for f in raw_fonts
+        if not any(f.startswith(prefix) for prefix in exclude_prefixes)
+    ]
+
+    font_options = ["Auto"] + filtered_fonts
+
+    default_font_name  = "Calibri" if "Calibri" in filtered_fonts else "Auto"
+    default_font_index = font_options.index(default_font_name)
+
+    # ------------------------------------------------------------
     # Sidebar
-    with st.sidebar:
-        st.header("Chart Settings")
-        box_width     = st.slider("Box Width", 0.2, 1.2, 0.60, 0.05)
-        hub_step      = st.slider("Hub Spacing", 0.5, 1.5, 0.90, 0.05)
-        label_xoffset = st.slider("Label X Offset", -0.05, 0.10, LABEL_XOFFSET_DEFAULT, 0.005)
-        edge_width    = st.slider("Edge Width", 1.0, 4.0, 2.2, 0.1)
-        fill_alpha    = st.slider("Box Fill Alpha", 0.0, 0.5, 0.12, 0.01)
-        show_grid_y   = st.checkbox("Show Y Gridlines", value=False)
+    # ------------------------------------------------------------
 
-        st.markdown("---")
-        center_single_hub = st.checkbox(
-            "Center layout when only one hub",
-            value=CENTER_SINGLE_HUB_DEFAULT,
+    with st.sidebar:
+
+        box_width = st.slider("Box Width", 0.2, 1.2, 0.60, 0.05)
+        hub_step  = st.slider("Hub Spacing", 0.5, 1.5, 0.90, 0.05)
+
+        label_xoffset = st.slider(
+            "Label X Offset",
+            -0.05, 0.10,
+            LABEL_XOFFSET_DEFAULT, 0.005
         )
+
+        edge_width = st.slider("Edge Width", 1.0, 4.0, 2.2, 0.1)
+
+        fill_alpha = st.slider("Box Fill Alpha", 0.0, 0.5, 0.12, 0.01)
+        show_grid_y = st.checkbox("Show Y Gridlines", False)
 
         st.markdown("---")
         st.subheader("Fonts")
 
-        # Display names in clean Title Case, mapped to actual backend values
-        font_display_names = [
-            "Auto",
-            "Arial",
-            "Calibri",
-            "Courier New",
-            "DejaVu Sans",
-            "Georgia",
-            "Helvetica",
-            "Monospace",
-            "Sans-Serif",
-            "Serif",
-            "Times New Roman",
-            "Verdana",
-        ]
-
-        font_map = {
-            "Auto": None,
-            "Arial": "Arial",
-            "Calibri": "Calibri",
-            "Courier New": "Courier New",
-            "DejaVu Sans": "DejaVu Sans",
-            "Georgia": "Georgia",
-            "Helvetica": "Helvetica",
-            "Monospace": "monospace",
-            "Sans-Serif": "sans-serif",
-            "Serif": "serif",
-            "Times New Roman": "Times New Roman",
-            "Verdana": "Verdana",
-        }
-
-        font_family_display = st.selectbox(
+        font_disp = st.selectbox(
             "Font Family",
-            options=font_display_names,
-            index=0,
+            font_options,
+            index=default_font_index
         )
 
-        selected_font = font_map[font_family_display]
-        if selected_font is not None:
-            plt.rcParams["font.family"] = selected_font
+        if font_disp == "Auto":
+            plt.rcParams["font.family"] = "sans-serif"
+        else:
+            plt.rcParams["font.family"] = font_disp
 
-        font_scale = st.slider(
-            "Font Scale",
-            0.50,
-            1.50,
-            FONT_SCALE_DEFAULT,
-            0.05,
-        )
+        font_scale = st.slider("Font Scale", 0.5, 2.0, FONT_SCALE_DEFAULT, 0.05)
 
         st.markdown("---")
         st.subheader("Colors")
-        solar_color = st.color_picker(
-            "Solar color",
-            value=TECH_COLORS_DEFAULT["Solar"],
-        )
-        wind_color  = st.color_picker(
-            "Wind color",
-            value=TECH_COLORS_DEFAULT["Wind"],
-        )
-        mixed_color = st.color_picker(
-            "All Technologies color",
-            value=MIXED_TECH_COLOR,
-        )
-        dot_color   = st.color_picker(
-            "Developer dot color",
-            value=DOT_COLOR_DEFAULT,
-        )
-        tech_colors = {"Solar": solar_color, "Wind": wind_color}
-        legend_bottom_center = st.checkbox(
-            "Legend at bottom center",
-            value=LEGEND_BOTTOM_CENTER_DEFAULT,
-        )
-        legend_frame = st.checkbox(
-            "Show legend border",
-            value=LEGEND_FRAME_DEFAULT,
-        )
+        sol_color = st.color_picker("Solar color", TECH_COLORS_DEFAULT["Solar"])
+        wind_color = st.color_picker("Wind color", TECH_COLORS_DEFAULT["Wind"])
+        mixed_color = st.color_picker("All Technologies color", MIXED_TECH_COLOR)
+        dot_color = st.color_picker("Developer dot color", DOT_COLOR_DEFAULT)
+        tech_colors = {"Solar": sol_color, "Wind": wind_color}
+
+        legend_bottom = st.checkbox("Legend at bottom center", True)
+        legend_frame  = st.checkbox("Show legend border", False)
 
         st.markdown("---")
         st.subheader("Y axis control")
-        include_dev_in_ylim = st.checkbox(
-            "Include developer dots when setting Y limits",
-            value=True,
-        )
-        extra_pad_abs = st.number_input(
-            "Extra padding ($/MWh)",
-            value=1.00,
-            min_value=0.00,
-            step=0.25,
-        )
-        force_ymin = st.checkbox(
-            "Force Y axis minimum",
-            value=False,
-        )
-        y_min_value = (
-            st.number_input(
-                "Y min (if forced)",
-                value=0.00,
-                step=1.0,
-            )
-            if force_ymin
-            else None
-        )
+        include_dev_ylim = st.checkbox("Include developer dots in Y limits", True)
+        extra_pad        = st.number_input("Extra padding ($/MWh)",
+                                           value=1.00, min_value=0.00, step=0.25)
+        force_ymin       = st.checkbox("Force Y axis minimum", False)
+        y_min_value      = st.number_input("Y min", 0.0, step=1.0) if force_ymin else None
 
         st.markdown("---")
         st.subheader("Box Mode")
         box_mode = st.radio(
             "Choose how the box should be drawn",
-            options=["P25-P50", "P10-P50", "Full"],
-            index=0,
-            help="P25 to P50 or P10 to P50 draw only a solid box with no whiskers. Full shows whiskers P10 to P90.",
+            ["P25-P75", "P25-P50", "P10-P50", "Full"],
+            index=0
         )
 
-    # Scope for ISO list
-    scope_for_isos = (
-        df_dev_scope
-        if all_techs
-        else df_dev_scope[df_dev_scope[TECH_COL] == tech_selected]
-    )
-    dev_isos = sorted(scope_for_isos[ISO_COL].unique().tolist())
-    if not dev_isos:
-        st.info(f"No {tech_label} projects found for this selection.")
+    # ------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------
+
+    scope = df_dev if all_techs else df_dev[df_dev[TECH_COL] == tech_sel]
+    isos  = sorted(scope[ISO_COL].unique().tolist())
+
+    if not isos:
+        st.info(f"No {tech_label} projects for this developer.")
         st.stop()
 
-    # Label offsets UI
-    st.subheader("Optional: Label Offsets (per hub, $/MWh)")
-    st.caption(
-        "Use small values like plus or minus 0.10 to nudge P10 P25 P50 P90 up or down. Leave blank to skip."
-    )
-    label_offsets_all_iso = {}
-    for iso in dev_isos:
-        hubs_for_iso = sorted(
-            scope_for_isos.loc[scope_for_isos[ISO_COL] == iso, HUB_COL].unique().tolist()
-        )
-        if not hubs_for_iso:
-            continue
-        with st.expander(f"{iso} - Set label offsets"):
-            iso_offsets = {}
-            for h in hubs_for_iso:
-                cols = st.columns(4)
-                p10 = cols[0].text_input(
-                    f"{h} P10",
-                    value="",
-                    key=f"{iso}_{tech_label}_{h}_P10",
-                )
-                p25 = cols[1].text_input(
-                    f"{h} P25",
-                    value="",
-                    key=f"{iso}_{tech_label}_{h}_P25",
-                )
-                p50 = cols[2].text_input(
-                    f"{h} P50",
-                    value="",
-                    key=f"{iso}_{tech_label}_{h}_P50",
-                )
-                p90 = cols[3].text_input(
-                    f"{h} P90",
-                    value="",
-                    key=f"{iso}_{tech_label}_{h}_P90",
-                )
-                inner = {}
-                for name, val in [
-                    ("P10", p10),
-                    ("P25", p25),
-                    ("P50", p50),
-                    ("P90", p90),
-                ]:
-                    if val.strip():
-                        try:
-                            inner[name] = float(val.strip())
-                        except Exception:
-                            st.warning(
-                                f"{iso}/{h} {name}: not a number, ignored."
-                            )
-                if inner:
-                    iso_offsets[h] = inner
-            label_offsets_all_iso[iso] = iso_offsets
+    center_single = True  # locked on
 
-    # --------- Render: per ISO panels for this developer ---------
-    for iso in dev_isos:
-        df_panel_scope = scope_for_isos[scope_for_isos[ISO_COL] == iso]
-        hubs_this_panel = sorted(df_panel_scope[HUB_COL].unique().tolist())
-        if not hubs_this_panel:
+    for iso in isos:
+        df_scope = scope[scope[ISO_COL] == iso]
+        hubs = sorted(df_scope[HUB_COL].unique().tolist())
+        if not hubs:
             continue
 
-        draw_dev_dots = not all_techs
-        dev_vals = (
-            df_panel_scope[PRICE_COL].to_numpy()
-            if (draw_dev_dots and include_dev_in_ylim)
-            else None
-        )
+        dev_vals = df_scope[PRICE_COL].to_numpy() if include_dev_ylim else None
 
         ylim = compute_iso_ylim_for_scope(
-            df,
+            stats_df,
             iso,
-            hubs_this_panel,
-            tech_selected,
+            hubs,
+            tech_sel,
             dev_vals=dev_vals,
-            extra_pad_abs=extra_pad_abs,
-            y_floor=y_min_value if force_ymin else None,
+            extra_pad_abs=extra_pad,
+            y_floor=y_min_value
         )
 
-        fig, ax = plt.subplots(1, 1, figsize=(11, 6))
+        fig, ax = plt.subplots(figsize=(11, 6))
+
         draw_iso_panel(
             ax,
             df_all=df,
-            df_panel_scope=df_panel_scope,
+            stats_df=stats_df,
+            df_scope=df_scope,
             iso=iso,
-            tech_or_none=tech_selected,
-            dev_name=dev,
+            tech_or_none=tech_sel,
+            dev=dev,
             tech_label=tech_label,
             box_width=box_width,
             hub_step=hub_step,
             label_xoffset=label_xoffset,
             edge_width=edge_width,
             fill_alpha=fill_alpha,
-            cap_width_fr=1 / 3,
+            cap_width_fr=1/3,
             show_grid_y=show_grid_y,
             share_ylim=ylim,
-            label_offsets_for_iso=label_offsets_all_iso.get(iso, {}),
-            center_single_hub=center_single_hub,
+            center_single=center_single,
             tech_colors=tech_colors,
             mixed_color=mixed_color,
             dot_color=dot_color,
-            legend_bottom_center=legend_bottom_center,
+            legend_bottom=legend_bottom,
             legend_frame=legend_frame,
             font_scale=font_scale,
             box_mode=box_mode,
-            draw_dev_dots=draw_dev_dots,
-        )
-        ax.set_xlabel(None)
-        ax.set_ylabel(PRICE_COL, fontsize=11 * font_scale)
-        ax.set_title(
-            f"{iso} {tech_label} Price Distribution • {dev}",
-            fontsize=12 * font_scale,
+            draw_dev_dots=True
         )
 
+        ax.set_ylabel(PRICE_COL, fontsize=11 * font_scale)
+        ax.set_title(f"{iso} {tech_label} Price Distribution",
+                     fontsize=12 * font_scale)
+
         st.pyplot(fig, clear_figure=False)
-        safe_dev = dev.replace(" ", "_")
-        safe_tech = tech_label.replace(" ", "_")
-        fname = (
-            f"{safe_dev}_{safe_tech}_{iso}_settlement_hub_prices.png"
-            .replace(" ", "_")
-        )
+
+        fname = f"{dev}_{tech_label}_{iso}.png".replace(" ", "_")
+
         st.download_button(
             "Download PNG",
             data=save_png_transparent(fig),
             file_name=fname,
-            mime="image/png",
+            mime="image/png"
         )
