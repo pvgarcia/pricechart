@@ -9,14 +9,19 @@ from io import BytesIO
 
 plt.rcParams["font.family"] = "Calibri"
 
-PRICE_COL  = "Price ($/MWh)"
-DEV_COL    = "Developer"
-ISO_COL    = "ISO/RTO"
-HUB_COL    = "Settlement Hub"
-TECH_COL   = "Technology"
-TERM_COL   = "Term (years)"
+# Column names (must match your Excel headers)
+PRICE_COL   = "Price ($/MWh)"
+DEV_COL     = "Developer"
+ISO_COL     = "ISO/RTO"
+HUB_COL     = "Settlement Hub"
+TECH_COL    = "Technology"
+TERM_COL    = "Term (years)"
+BID_COL     = "Bid IDs"          # internal only
+PROJECT_COL = "Project Name"     # client-facing (not shown on chart in this version)
 
-REQUIRED_COLS = [PRICE_COL, DEV_COL, ISO_COL, HUB_COL, TECH_COL, TERM_COL]
+# Required columns
+REQUIRED_COLS_DEV = [PRICE_COL, DEV_COL, ISO_COL, HUB_COL, TECH_COL, TERM_COL, BID_COL, PROJECT_COL]
+REQUIRED_COLS_MKT = [PRICE_COL, ISO_COL, HUB_COL, TECH_COL, TERM_COL]
 
 # Colors
 ALL_TECH_COLOR = "#0EC477"
@@ -30,17 +35,12 @@ TECH_TO_BOX_COLOR = {
     "Wind": WIND_COLOR
 }
 
-# Visibility defaults
 LABEL_XOFFSET_DEFAULT = 0.06
 FONT_SCALE_DEFAULT    = 0.50
-DOT_SIZE_DEFAULT      = 30
-DOT_EDGE_DEFAULT      = 0.7
-DOT_JITTER_DEFAULT    = 0.0  # default should be zero
 
-# Sparse term logic
+# Term sparsity rule
 SPARSE_TERMS_ALWAYS_ALL = {4, 7, 15, 20}
-ISO_MIN_N_FOR_TERM_BOX  = 5
-HUB_MIN_N_FOR_TERM_BOX  = 5
+MIN_N_FOR_TERM_BOX      = 5
 
 
 def fmt_currency(x, pos):
@@ -98,12 +98,13 @@ def find_header_rows(raw_df: pd.DataFrame, required_cols: list[str]) -> list[int
 
 
 def extract_tables_from_sheet(df_noheader: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
-    header_rows = find_header_rows(df_noheader, REQUIRED_COLS)
+    header_rows = sorted(
+        set(find_header_rows(df_noheader, REQUIRED_COLS_MKT) + find_header_rows(df_noheader, REQUIRED_COLS_DEV))
+    )
     if not header_rows:
         return pd.DataFrame()
 
     blocks = []
-    header_rows = sorted(header_rows)
     header_rows_end = header_rows + [len(df_noheader)]
 
     for h_i, h_row in enumerate(header_rows):
@@ -157,11 +158,15 @@ def load_all_tables_from_workbook(uploaded_file) -> pd.DataFrame:
 def normalize_common_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df[ISO_COL]  = df[ISO_COL].astype("string").str.strip()
-    df[HUB_COL]  = df[HUB_COL].astype("string").str.strip().str.upper()
+    if ISO_COL in df.columns:
+        df[ISO_COL] = df[ISO_COL].astype("string").str.strip()
+    if HUB_COL in df.columns:
+        df[HUB_COL] = df[HUB_COL].astype("string").str.strip().str.upper()
 
-    df[PRICE_COL] = pd.to_numeric(df[PRICE_COL], errors="coerce")
-    df[TERM_COL]  = pd.to_numeric(df[TERM_COL], errors="coerce")
+    if PRICE_COL in df.columns:
+        df[PRICE_COL] = pd.to_numeric(df[PRICE_COL], errors="coerce")
+    if TERM_COL in df.columns:
+        df[TERM_COL] = pd.to_numeric(df[TERM_COL], errors="coerce")
 
     def _norm_tech(x):
         x = str(x).strip()
@@ -174,21 +179,24 @@ def normalize_common_cols(df: pd.DataFrame) -> pd.DataFrame:
             return "Wind"
         return x.title()
 
-    df[TECH_COL] = df[TECH_COL].map(_norm_tech)
-    df[HUB_COL]  = df[HUB_COL].replace(r".*\bALBERTA\b.*", "ALBERTA", regex=True)
+    if TECH_COL in df.columns:
+        df[TECH_COL] = df[TECH_COL].map(_norm_tech)
+
+    if HUB_COL in df.columns:
+        df[HUB_COL] = df[HUB_COL].replace(r".*\bALBERTA\b.*", "ALBERTA", regex=True)
+
     return df
 
 
 def clean_market_df(df_extracted: pd.DataFrame) -> pd.DataFrame:
     df = df_extracted.copy()
-    needed = [PRICE_COL, ISO_COL, HUB_COL, TECH_COL, TERM_COL]
-    missing = [c for c in needed if c not in df.columns]
+    missing = [c for c in REQUIRED_COLS_MKT if c not in df.columns]
     if missing:
-        st.error(f"Missing required columns after extraction: {missing}")
+        st.error(f"Missing required market columns after extraction: {missing}")
         st.stop()
 
     df = normalize_common_cols(df)
-    df = df.dropna(subset=[PRICE_COL, ISO_COL, HUB_COL, TERM_COL])
+    df = df.dropna(subset=[PRICE_COL, ISO_COL, HUB_COL, TECH_COL, TERM_COL])
     df = df[df[ISO_COL].astype("string").str.len() > 0]
     df = df[df[HUB_COL].astype("string").str.len() > 0]
     return df
@@ -196,268 +204,142 @@ def clean_market_df(df_extracted: pd.DataFrame) -> pd.DataFrame:
 
 def clean_dev_df(df_extracted: pd.DataFrame) -> pd.DataFrame:
     df = df_extracted.copy()
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    missing = [c for c in REQUIRED_COLS_DEV if c not in df.columns]
     if missing:
-        st.error(f"Missing required columns after extraction: {missing}")
+        st.error(f"Missing required developer columns after extraction: {missing}")
         st.stop()
 
     df = normalize_common_cols(df)
 
     df[DEV_COL] = normalize_dev_series(df[DEV_COL])
-    df = df.dropna(subset=[DEV_COL])
-    df = df[df[DEV_COL].str.len() > 0]
+    df[BID_COL] = df[BID_COL].astype("string").str.strip()
+    df[PROJECT_COL] = df[PROJECT_COL].astype("string").str.strip()
 
-    df = df.dropna(subset=[PRICE_COL, ISO_COL, HUB_COL, TERM_COL])
+    df = df.dropna(subset=[DEV_COL, BID_COL, PROJECT_COL])
+    df = df[df[DEV_COL].str.len() > 0]
+    df = df[df[BID_COL].str.len() > 0]
+    df = df[df[PROJECT_COL].str.len() > 0]
+
+    df = df.dropna(subset=[PRICE_COL, ISO_COL, HUB_COL, TECH_COL, TERM_COL])
     return df
 
 
-@st.cache_data(show_spinner=False)
-def precompute_iso_stats(df_market: pd.DataFrame) -> pd.DataFrame:
-    qs = [0.10, 0.25, 0.50, 0.75, 0.90]
-    return (
-        df_market.groupby([ISO_COL])[PRICE_COL]
-                 .quantile(qs)
-                 .unstack(level=-1)
-                 .rename(columns={0.10: "p10", 0.25: "p25", 0.50: "p50", 0.75: "p75", 0.90: "p90"})
-                 .reset_index()
-    )
+def compute_market_stats(series: pd.Series) -> dict:
+    qs = series.quantile([0.10, 0.25, 0.50, 0.75, 0.90]).to_dict()
+    return {
+        "p10": float(qs.get(0.10, np.nan)),
+        "p25": float(qs.get(0.25, np.nan)),
+        "p50": float(qs.get(0.50, np.nan)),
+        "p75": float(qs.get(0.75, np.nan)),
+        "p90": float(qs.get(0.90, np.nan)),
+    }
 
 
-@st.cache_data(show_spinner=False)
-def precompute_iso_hub_stats(df_market: pd.DataFrame) -> pd.DataFrame:
-    qs = [0.10, 0.25, 0.50, 0.75, 0.90]
-    return (
-        df_market.groupby([ISO_COL, HUB_COL])[PRICE_COL]
-                 .quantile(qs)
-                 .unstack(level=-1)
-                 .rename(columns={0.10: "p10", 0.25: "p25", 0.50: "p50", 0.75: "p75", 0.90: "p90"})
-                 .reset_index()
-    )
+def compute_ylim(mkt_stats: dict, dev_vals: np.ndarray, extra_pad_abs: float = 1.0):
+    lo = np.nanmin([mkt_stats["p10"], np.min(dev_vals)])
+    hi = np.nanmax([mkt_stats["p90"], np.max(dev_vals)])
 
-
-def staggered_labels(stt, eps):
-    pts = [("P90", stt["p90"]), ("P75", stt["p75"]), ("P50", stt["p50"]), ("P25", stt["p25"]), ("P10", stt["p10"])]
-    placed, out = [], []
-    for label, y in pts:
-        y_adj = y
-        for yy, _ in placed:
-            if abs(y_adj - yy) < eps:
-                y_adj = yy - eps * 0.6
-        placed.append((y_adj, label))
-        out.append((y_adj, label))
-    return out
-
-
-def is_skinny_box(row, threshold):
-    try:
-        return abs(float(row["p75"]) - float(row["p25"])) < float(threshold)
-    except Exception:
-        return False
-
-
-def compute_ylim_from_boxes_and_dots(box_rows: list, dot_vals=None, extra_pad_abs=0.0, y_floor=None):
-    lo = np.inf
-    hi = -np.inf
-    for r in box_rows:
-        lo = min(lo, float(r["p10"]))
-        hi = max(hi, float(r["p90"]))
-
-    if dot_vals is not None and len(dot_vals):
-        lo = min(lo, float(np.min(dot_vals)))
-        hi = max(hi, float(np.max(dot_vals)))
-
-    if lo == np.inf:
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
         lo, hi = 0.0, 1.0
 
-    span = hi - lo if hi > lo else 1.0
-    pad = 0.06 * span
-    lo -= pad + extra_pad_abs
-    hi += pad + extra_pad_abs
-
-    if y_floor is not None:
-        lo = float(y_floor)
-
-    if not lo < hi:
-        hi = lo + 1.0
-
-    return lo, hi
+    span = hi - lo
+    pad = 0.06 * span + extra_pad_abs
+    return lo - pad, hi + pad
 
 
-def draw_combined_iso_chart(
+def draw_box_and_dev_overlay(
     ax,
     *,
-    boxes_by_iso: dict,
     df_dev: pd.DataFrame,
-    box_width,
-    hub_step,
-    iso_gap,
-    label_xoffset,
-    edge_width,
-    fill_alpha,
-    cap_width_fr,
-    show_grid_y,
-    share_ylim,
-    box_color,
-    dot_color,
-    font_scale,
-    box_mode,
-    dot_outlier_mode,
-    dot_jitter,
-    dot_size,
-    dot_edgewidth
+    mkt_stats: dict,
+    box_color: str,
+    font_scale: float,
+    show_grid_y: bool,
+    box_mode: str,
+    dev_dot_color: str,
+    label_xoffset: float = LABEL_XOFFSET_DEFAULT,
+    dot_size: int = 65,
+    dot_edgewidth: float = 0.7,
+    fill_alpha: float = 0.18,
+    edge_width: float = 2.0
 ):
-    rng = np.random.default_rng(12345)
     face = mcolors.to_rgba(box_color, fill_alpha)
-    cap_half = box_width * cap_width_fr
-
     fs_tick = 10 * font_scale
     fs_lbl  = 9 * font_scale
 
-    x_ticks = []
-    x_labels = []
-    separators = []
-    x_cursor = 0.0
-    label_once = False
+    x0 = 0.0
+    box_width = 0.90
+    cap_half = box_width * (1 / 3)
 
-    isos_sorted = sorted(boxes_by_iso.keys())
+    p10, p25, p50, p75, p90 = mkt_stats["p10"], mkt_stats["p25"], mkt_stats["p50"], mkt_stats["p75"], mkt_stats["p90"]
 
-    for i, iso in enumerate(isos_sorted):
-        df_dev_iso = df_dev[df_dev[ISO_COL] == iso].copy()
-        hubs = sorted(df_dev_iso[HUB_COL].dropna().unique().tolist())
-        if not hubs:
-            continue
+    # Determine box bounds and labels
+    if box_mode == "P25-P75":
+        y0, y1 = p25, p75
+        whisk = False
+        labels = [("P75", p75), ("P50", p50), ("P25", p25)]
+    elif box_mode == "P25-P50":
+        y0, y1 = p25, p50
+        whisk = False
+        labels = [("P50", p50), ("P25", p25)]
+    else:  # Full
+        y0, y1 = p25, p75
+        whisk = True
+        labels = [("P90", p90), ("P75", p75), ("P50", p50), ("P25", p25), ("P10", p10)]
 
-        xpos = {h: x_cursor + j * hub_step for j, h in enumerate(hubs)}
-        group_xs = list(xpos.values())
-        x_left = min(group_xs)
-        x_right = max(group_xs)
-        x_center = 0.5 * (x_left + x_right)
-
-        box_row = boxes_by_iso[iso]
-        stt = {k: float(box_row[k]) for k in ["p10", "p25", "p50", "p75", "p90"]}
-
-        y25, y50, y75 = stt["p25"], stt["p50"], stt["p75"]
-        y10, y90      = stt["p10"], stt["p90"]
-
-        if box_mode == "P25-P75":
-            y0, y1 = y25, y75
-            labels = [("P25", y25), ("P75", y75)]
-            whisk  = False
-        elif box_mode == "P25-P50":
-            y0, y1 = y25, y50
-            labels = [("P25", y25), ("P50", y50)]
-            whisk  = False
-        elif box_mode == "P10-P50":
-            y0, y1 = y10, y50
-            labels = [("P10", y10), ("P50", y50)]
-            whisk  = False
-        else:
-            y0, y1 = y25, y75
-            labels = None
-            whisk  = True
-
-        ax.add_patch(
-            plt.Rectangle(
-                (x_center - box_width / 2, y0),
-                box_width, y1 - y0,
-                facecolor=face,
-                edgecolor=box_color,
-                linewidth=edge_width
-            )
+    # Market box
+    ax.add_patch(
+        plt.Rectangle(
+            (x0 - box_width / 2, y0),
+            box_width, y1 - y0,
+            facecolor=face,
+            edgecolor=box_color,
+            linewidth=edge_width
         )
+    )
 
-        def label_pos(x):
-            return x + box_width / 2 + max(0.005, label_xoffset), "left"
+    # Whiskers only in Full mode
+    if whisk:
+        ax.vlines(x0, p75, p90, color=box_color, linewidth=edge_width)
+        ax.hlines(p90, x0 - cap_half, x0 + cap_half, color=box_color, linewidth=edge_width)
 
-        bbox_kw = dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.75)
+        ax.vlines(x0, p25, p10, color=box_color, linewidth=edge_width)
+        ax.hlines(p10, x0 - cap_half, x0 + cap_half, color=box_color, linewidth=edge_width)
 
-        if whisk:
-            ax.vlines(x_center, y75, y90, color=box_color, linewidth=edge_width)
-            ax.hlines(y90, x_center - cap_half, x_center + cap_half, color=box_color, linewidth=edge_width)
+    # Percentile labels (right of box)
+    bbox_kw = dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.75)
+    x_lbl = x0 + box_width / 2 + max(0.01, label_xoffset)
+    for lbl, yv in labels:
+        ax.text(x_lbl, yv, lbl, fontsize=fs_lbl, va="center", ha="left", bbox=bbox_kw)
 
-            ax.vlines(x_center, y25, y10, color=box_color, linewidth=edge_width)
-            ax.hlines(y10, x_center - cap_half, x_center + cap_half, color=box_color, linewidth=edge_width)
+    # Developer dots (no sideways, ever)
+    vals = df_dev[PRICE_COL].to_numpy(dtype=float)
+    xj = np.full(len(vals), x0, dtype=float)
 
-            span = max(y90 - y10, 1.0)
-            eps  = max(0.01 * span, 0.25)
-            for y_adj, lbl in staggered_labels(stt, eps):
-                xlbl, ha = label_pos(x_center)
-                ax.text(xlbl, y_adj, lbl, fontsize=fs_lbl, va="center", ha=ha, bbox=bbox_kw)
-        else:
-            for lbl, yv in labels:
-                xlbl, ha = label_pos(x_center)
-                ax.text(xlbl, yv, lbl, fontsize=fs_lbl, va="center", ha=ha, bbox=bbox_kw)
+    ax.scatter(
+        xj, vals,
+        s=dot_size,
+        color=dev_dot_color,
+        edgecolor="black",
+        linewidth=dot_edgewidth,
+        alpha=0.95,
+        zorder=10
+    )
 
-        clip_lo, clip_hi = None, None
-        if dot_outlier_mode == "Clip to P10-P90":
-            clip_lo, clip_hi = stt["p10"], stt["p90"]
-        elif dot_outlier_mode == "Clip to P25-P75":
-            clip_lo, clip_hi = stt["p25"], stt["p75"]
-
-        for h in hubs:
-            vals = df_dev_iso.loc[df_dev_iso[HUB_COL] == h, PRICE_COL].to_numpy()
-            if len(vals) == 0:
-                continue
-
-            plot_vals = vals.copy()
-            if clip_lo is not None and clip_hi is not None:
-                plot_vals = np.clip(plot_vals, clip_lo, clip_hi)
-
-            x0 = xpos[h]
-            if dot_jitter > 0:
-                xj = x0 + rng.uniform(-dot_jitter, dot_jitter, size=len(plot_vals))
-            else:
-                xj = np.full(len(plot_vals), x0)
-
-            ax.scatter(
-                xj, plot_vals,
-                s=dot_size,
-                color=dot_color,
-                edgecolor="black",
-                linewidth=dot_edgewidth,
-                alpha=0.95,
-                label=f"{df_dev_iso[DEV_COL].iloc[0]} Projects" if not label_once else None
-            )
-            label_once = True
-
-        for h in hubs:
-            x_ticks.append(xpos[h])
-            x_labels.append(f"{iso} {h}")
-
-        x_cursor = x_right + iso_gap
-        if i < len(isos_sorted) - 1:
-            separators.append(x_right + iso_gap * 0.5)
-
-    ax.set_xticks(x_ticks)
-    ax.set_xticklabels(x_labels, rotation=25, ha="right", fontsize=fs_tick)
-
+    # Axes formatting
     ax.yaxis.set_major_formatter(FuncFormatter(fmt_currency))
-    for lbl in ax.yaxis.get_ticklabels():
-        lbl.set_fontsize(fs_tick)
+    for t in ax.yaxis.get_ticklabels():
+        t.set_fontsize(fs_tick)
 
-    ax.grid(axis="y", alpha=0.2 if show_grid_y else 0.0)
-    ax.set_ylim(*share_ylim)
+    ax.grid(axis="y", alpha=0.18 if show_grid_y else 0.0)
 
-    # KEY FIX: dynamic x padding based on hub_step (so squeeze actually works)
-    if x_ticks:
-        xmin, xmax = min(x_ticks), max(x_ticks)
-        base_pad = hub_step * 0.6
-        ax.set_xlim(xmin - base_pad, xmax + base_pad)
-
-    for xs in separators:
-        ax.axvline(xs, alpha=0.25, linewidth=1.0)
-
-    if label_once:
-        ax.legend(
-            frameon=False,
-            loc="lower center",
-            bbox_to_anchor=(0.5, -0.24),
-            fontsize=fs_lbl
-        )
+    # No x axis
+    ax.set_xticks([])
+    ax.set_xlim(-1.0, 1.0)  # symmetric, centered
 
 
-st.set_page_config(page_title="ISO/RTO Price Distribution", layout="wide")
-st.title("ISO/RTO Price Distribution")
+st.set_page_config(page_title="Developer Bid Feedback", layout="wide")
+st.title("SAP Developer Bid Feedback")
 
 uploaded = st.file_uploader("Upload financials.xlsx", type=["xlsx"])
 
@@ -470,6 +352,7 @@ if uploaded is not None:
     df_market_all = clean_market_df(df_extracted)
     df_dev_all    = clean_dev_df(df_extracted)
 
+    # Term selector
     terms = sorted(df_market_all[TERM_COL].dropna().unique().tolist())
     terms = [int(t) if float(t).is_integer() else float(t) for t in terms]
     if not terms:
@@ -478,8 +361,9 @@ if uploaded is not None:
 
     term_choice = st.selectbox("Select Term (years)", terms, index=0)
 
-    df_dev_term_all = df_dev_all[term_equal(df_dev_all[TERM_COL], term_choice)].copy()
-    devs = sorted(df_dev_term_all[DEV_COL].dropna().unique().tolist())
+    # Developer selector within term
+    df_dev_term = df_dev_all[term_equal(df_dev_all[TERM_COL], term_choice)].copy()
+    devs = sorted(df_dev_term[DEV_COL].dropna().unique().tolist())
     devs = [d for d in devs if str(d).strip() != ""]
     if not devs:
         st.warning("No developers found for this term after cleaning.")
@@ -487,11 +371,12 @@ if uploaded is not None:
 
     dev = st.selectbox("Select Developer", devs)
 
-    df_dev = df_dev_term_all[df_dev_term_all[DEV_COL] == dev].copy()
+    df_dev = df_dev_term[df_dev_term[DEV_COL] == dev].copy()
     if df_dev.empty:
-        st.warning("No developer projects for that term after cleaning.")
+        st.warning("No developer bids found for that term after cleaning.")
         st.stop()
 
+    # Tech selector
     tech_options = ["All Technologies"] + sorted(df_dev[TECH_COL].dropna().unique().tolist())
     tech_choice = st.selectbox("Select Technology", tech_options, index=0)
     tech_sel = None if tech_choice == "All Technologies" else tech_choice
@@ -500,11 +385,10 @@ if uploaded is not None:
         df_dev = df_dev[df_dev[TECH_COL] == tech_sel].copy()
 
     if df_dev.empty:
-        st.warning("No developer projects for that term and tech after filtering.")
+        st.warning("No developer bids for that term and tech after filtering.")
         st.stop()
 
-    box_color = TECH_TO_BOX_COLOR.get(tech_choice, ALL_TECH_COLOR)
-
+    # Fonts list
     raw_fonts = sorted({f.name for f in fm.fontManager.ttflist})
     exclude_prefixes = ("cm", "CM", "TeX", "STIX", "ZWAdobeF", "ZW")
     filtered_fonts = [f for f in raw_fonts if not any(f.startswith(prefix) for prefix in exclude_prefixes)]
@@ -513,183 +397,72 @@ if uploaded is not None:
     default_font_index = font_options.index(default_font_name) if default_font_name in font_options else 0
 
     with st.sidebar:
-        squeeze = st.slider("Squeeze chart width", 0.70, 1.00, 0.80)
-
-        box_width = st.slider("Box Width", 0.2, 1.2, 0.80, 0.05)
-        hub_step  = st.slider("Hub Spacing", 0.5, 1.5, 0.95, 0.05) * squeeze
-        iso_gap   = st.slider("ISO group gap", 0.8, 3.0, 1.25, 0.05) * squeeze
-
-        label_xoffset = st.slider("Label X Offset", -0.05, 0.15, LABEL_XOFFSET_DEFAULT, 0.005)
-        edge_width = st.slider("Edge Width", 1.0, 3.0, 2.8, 0.1)
-        fill_alpha = st.slider("Box Fill Alpha", 0.0, 0.5, 0.18, 0.01)
-        show_grid_y = st.checkbox("Show Y Gridlines", False)
-
         st.subheader("Fonts")
         font_disp = st.selectbox("Font Family", font_options, index=default_font_index)
         plt.rcParams["font.family"] = "sans-serif" if font_disp == "Auto" else font_disp
         font_scale = st.slider("Font Scale", 0.5, 2.0, FONT_SCALE_DEFAULT, 0.05)
 
-        st.subheader("Dot styling")
-        dot_color = st.color_picker("Developer dot color", DOT_COLOR_DEFAULT)
-        dot_outlier_mode = st.radio("Outlier handling (display only)", ["None", "Clip to P10-P90", "Clip to P25-P75"], index=1)
-        dot_jitter = st.slider("Dot jitter (horizontal)", 0.0, 0.20, DOT_JITTER_DEFAULT, 0.01)
-        dot_size = st.slider("Dot size", 10, 20, DOT_SIZE_DEFAULT, 10)
-        dot_edge = st.slider("Dot edge width", 0.2, 1.5, DOT_EDGE_DEFAULT, 0.1)
-
-        st.subheader("Market box fallback")
-        use_all_market_points_box = st.checkbox(
-            "If box is skinny, use ALL market points (ignore term + tech) for the box",
-            value=False
-        )
-        skinny_box_threshold = st.number_input(
-            "Skinny box threshold ($/MWh) for P75-P25",
-            value=0.50,
-            min_value=0.00,
-            step=0.25
-        )
-
-        st.subheader("Y axis control")
-        include_dev_ylim = st.checkbox("Include developer dots in Y limits", True)
-        extra_pad = st.number_input("Extra padding ($/MWh)", value=1.00, min_value=0.00, step=0.25)
-        force_ymin = st.checkbox("Force Y axis minimum", False)
-        y_min_value = st.number_input("Y min", 0.0, step=1.0) if force_ymin else None
+        show_grid_y = st.checkbox("Show Y Gridlines", False)
 
         st.subheader("Box Mode")
-        box_mode = st.radio("Choose how the box should be drawn", ["P25-P75", "P25-P50", "P10-P50", "Full"], index=0)
+        box_mode = st.radio("Choose how the box should be drawn", ["P25-P75", "P25-P50", "Full"], index=0)
 
-        st.subheader("Box scope logic")
-        use_hub_box_when_single = st.checkbox(
-            "If developer has only one hub in an ISO, build box from that hub",
-            value=True
-        )
+        st.subheader("Developer dots")
+        dev_dot_color = st.color_picker("Developer dot color", DOT_COLOR_DEFAULT)
 
-    isos = sorted(df_dev[ISO_COL].dropna().unique().tolist())
+    # Market box data: filter to same term, and same tech only if selected
     term_is_sparse = int(float(term_choice)) in SPARSE_TERMS_ALWAYS_ALL
 
-    boxes_by_iso = {}
-    box_rows_for_ylim = []
+    df_market_term = df_market_all[term_equal(df_market_all[TERM_COL], term_choice)].copy()
+    term_ok = (not term_is_sparse) and (len(df_market_term) >= MIN_N_FOR_TERM_BOX)
 
-    for iso in isos:
-        df_dev_iso = df_dev[df_dev[ISO_COL] == iso].copy()
-        if df_dev_iso.empty:
-            continue
+    df_market_for_box = df_market_term if term_ok else df_market_all.copy()
 
-        hubs_dev = sorted(df_dev_iso[HUB_COL].dropna().unique().tolist())
+    if tech_sel is not None:
+        df_market_for_box = df_market_for_box[df_market_for_box[TECH_COL] == tech_sel].copy()
 
-        df_market_iso = df_market_all[df_market_all[ISO_COL] == iso].copy()
-        if tech_sel is not None:
-            df_market_iso = df_market_iso[df_market_iso[TECH_COL] == tech_sel].copy()
-
-        df_market_iso_term = df_market_iso[term_equal(df_market_iso[TERM_COL], term_choice)].copy()
-
-        iso_term_ok = (not term_is_sparse) and (len(df_market_iso_term) >= ISO_MIN_N_FOR_TERM_BOX)
-        df_market_for_iso_stats = df_market_iso_term if iso_term_ok else df_market_iso
-
-        iso_stats_df = precompute_iso_stats(df_market_for_iso_stats)
-        box_row = iso_stats_df[iso_stats_df[ISO_COL] == iso]
-        if box_row.empty:
-            continue
-
-        chosen_row = box_row.iloc[0]
-
-        if iso_term_ok and is_skinny_box(chosen_row, skinny_box_threshold):
-            iso_stats_all_terms = precompute_iso_stats(df_market_iso)
-            box_row_all_terms = iso_stats_all_terms[iso_stats_all_terms[ISO_COL] == iso]
-            if not box_row_all_terms.empty:
-                chosen_row = box_row_all_terms.iloc[0]
-
-        if use_all_market_points_box and is_skinny_box(chosen_row, skinny_box_threshold):
-            df_market_iso_all = df_market_all[df_market_all[ISO_COL] == iso].copy()
-            iso_stats_all_market = precompute_iso_stats(df_market_iso_all)
-            box_row_all_market = iso_stats_all_market[iso_stats_all_market[ISO_COL] == iso]
-            if not box_row_all_market.empty:
-                chosen_row = box_row_all_market.iloc[0]
-
-        if use_hub_box_when_single and len(hubs_dev) == 1:
-            hub = hubs_dev[0]
-
-            df_hub_term = df_market_iso_term[df_market_iso_term[HUB_COL] == hub].copy()
-            hub_term_ok = iso_term_ok and (len(df_hub_term) >= HUB_MIN_N_FOR_TERM_BOX)
-
-            if hub_term_ok:
-                df_market_for_hub_stats = df_hub_term
-            else:
-                df_market_for_hub_stats = df_market_iso[df_market_iso[HUB_COL] == hub].copy()
-
-            iso_hub_stats_df = precompute_iso_hub_stats(df_market_for_hub_stats)
-            hub_row = iso_hub_stats_df[
-                (iso_hub_stats_df[ISO_COL] == iso) &
-                (iso_hub_stats_df[HUB_COL] == hub)
-            ]
-            if not hub_row.empty:
-                chosen_row = hub_row.iloc[0]
-
-                if use_all_market_points_box and is_skinny_box(chosen_row, skinny_box_threshold):
-                    df_hub_all = df_market_all[
-                        (df_market_all[ISO_COL] == iso) &
-                        (df_market_all[HUB_COL] == hub)
-                    ].copy()
-                    hub_stats_all_market = precompute_iso_hub_stats(df_hub_all)
-                    hub_row_all_market = hub_stats_all_market[
-                        (hub_stats_all_market[ISO_COL] == iso) &
-                        (hub_stats_all_market[HUB_COL] == hub)
-                    ]
-                    if not hub_row_all_market.empty:
-                        chosen_row = hub_row_all_market.iloc[0]
-
-        boxes_by_iso[iso] = chosen_row
-        box_rows_for_ylim.append(chosen_row)
-
-    if not boxes_by_iso:
-        st.warning("No market stats available for the selected developer, term, and tech.")
+    if df_market_for_box.empty:
+        st.warning("No market data available for the selected term and tech.")
         st.stop()
 
-    dot_vals_all = df_dev[PRICE_COL].to_numpy() if include_dev_ylim else None
-    ylim = compute_ylim_from_boxes_and_dots(
-        box_rows_for_ylim,
-        dot_vals=dot_vals_all,
-        extra_pad_abs=extra_pad,
-        y_floor=y_min_value
-    )
+    mkt_stats = compute_market_stats(df_market_for_box[PRICE_COL])
+    if not np.isfinite(mkt_stats["p10"]) or not np.isfinite(mkt_stats["p90"]):
+        st.warning("Market stats could not be computed from the available data.")
+        st.stop()
 
-    # Optional: make figure width responsive so whitespace shrinks further
-    n_hubs = df_dev[HUB_COL].nunique()
-    n_isos = len(boxes_by_iso)
-    fig_width = max(8.0, min(18.0, (2.2 + 0.65 * (n_hubs + n_isos)) * squeeze))
+    # Stable sort (Bid IDs internal)
+    df_dev = df_dev.sort_values(by=[PROJECT_COL, BID_COL]).copy()
+    dev_vals = df_dev[PRICE_COL].to_numpy(dtype=float)
 
-    fig, ax = plt.subplots(figsize=(fig_width, 6))
-    fig.subplots_adjust(bottom=0.25)
+    box_color = TECH_TO_BOX_COLOR.get(tech_choice, ALL_TECH_COLOR)
+    ylim = compute_ylim(mkt_stats, dev_vals, extra_pad_abs=1.0)
 
-    draw_combined_iso_chart(
+    # Slightly taller bottom margin for footer label
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.subplots_adjust(bottom=0.14)
+
+    draw_box_and_dev_overlay(
         ax,
-        boxes_by_iso=boxes_by_iso,
         df_dev=df_dev,
-        box_width=box_width,
-        hub_step=hub_step,
-        iso_gap=iso_gap,
-        label_xoffset=label_xoffset,
-        edge_width=edge_width,
-        fill_alpha=fill_alpha,
-        cap_width_fr=1/3,
-        show_grid_y=show_grid_y,
-        share_ylim=ylim,
+        mkt_stats=mkt_stats,
         box_color=box_color,
-        dot_color=dot_color,
         font_scale=font_scale,
+        show_grid_y=show_grid_y,
         box_mode=box_mode,
-        dot_outlier_mode=dot_outlier_mode,
-        dot_jitter=dot_jitter,
-        dot_size=dot_size,
-        dot_edgewidth=dot_edge
+        dev_dot_color=dev_dot_color
     )
 
+    ax.set_ylim(*ylim)
     ax.set_ylabel(PRICE_COL, fontsize=11 * font_scale)
-    ax.set_xlabel("")  # removes the x-axis label text above the legend
-    ax.set_title(dev, fontsize=13 * font_scale)
+    ax.set_xlabel("")
+
+    # No chart title. Add bottom-center caption like a legend.
+    caption = f"{dev} | {tech_choice} | {term_choice} yr"
+    fig.text(0.5, 0.08, caption, ha="center", va="center", fontsize=11 * font_scale)
 
     st.pyplot(fig, clear_figure=False)
 
-    fname = f"{dev}_{tech_choice}_{term_choice}yr_combined.png".replace(" ", "_")
+    fname = f"{dev}_{tech_choice}_{term_choice}yr_bid_feedback_overlay.png".replace(" ", "_")
     st.download_button(
         "Download PNG",
         data=save_png_transparent(fig),
